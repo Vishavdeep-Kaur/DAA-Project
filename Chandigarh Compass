@@ -1,0 +1,412 @@
+"""Chandigarh city route planner: a simple Tkinter Dijkstra demo."""
+import heapq
+import zlib
+import tkinter as tk
+from tkinter import ttk
+
+# Sample road distances in kilometres. This is a learning demo, not live navigation.
+PLACES = {
+    "Chandigarh Railway Station": [("Chandigarh Airport", 8), ("Industrial Area", 4), ("Sukhna Lake", 8)],
+    "Chandigarh Airport": [("Chandigarh Railway Station", 8), ("Capitol Complex", 13), ("Elante Mall", 6), ("Rose Garden", 11)],
+    "ISBT Sector 17": [("Sector 17 Plaza", 1), ("Capitol Complex", 4), ("Rose Garden", 3), ("Panjab University", 5), ("PGIMER", 4)],
+    "ISBT Sector 43": [("Chandigarh Airport", 8), ("Garden of Silence", 8), ("Cricket Stadium", 5), ("Capitol Complex", 8)],
+    "Sector 17 Plaza": [("ISBT Sector 17", 1), ("Rose Garden", 2), ("Tagore Theatre", 2), ("Elante Mall", 4)],
+    "Capitol Complex": [("ISBT Sector 17", 4), ("ISBT Sector 43", 8), ("Sukhna Lake", 4), ("Panjab University", 3), ("Rose Garden", 3)],
+    "Rose Garden": [("ISBT Sector 17", 3), ("Sector 17 Plaza", 2), ("Capitol Complex", 3), ("Tagore Theatre", 2), ("Panjab University", 4)],
+    "Panjab University": [("Capitol Complex", 3), ("Rose Garden", 4), ("PGIMER", 2), ("Sukhna Lake", 5), ("ISBT Sector 17", 5)],
+    "PGIMER": [("ISBT Sector 17", 4), ("Panjab University", 2), ("Sukhna Lake", 4), ("Tagore Theatre", 3)],
+    "Sukhna Lake": [("Capitol Complex", 4), ("Panjab University", 5), ("PGIMER", 4), ("Chandigarh Railway Station", 8), ("Rock Garden", 2)],
+    "Rock Garden": [("Sukhna Lake", 2), ("Capitol Complex", 2), ("Panjab University", 5)],
+    "Zakir Hussain Rose Garden": [("Rose Garden", 1), ("Sector 17 Plaza", 3), ("Tagore Theatre", 3)],
+    "Tagore Theatre": [("Sector 17 Plaza", 2), ("Rose Garden", 2), ("PGIMER", 3), ("Zakir Hussain Rose Garden", 3)],
+    "Elante Mall": [("Chandigarh Airport", 6), ("Industrial Area", 2), ("Chandigarh Railway Station", 3), ("Sector 17 Plaza", 4)],
+    "Industrial Area": [("Chandigarh Railway Station", 4), ("Elante Mall", 2), ("Sector 17 Plaza", 5)],
+    "Cricket Stadium": [("ISBT Sector 43", 5), ("Garden of Silence", 3), ("Sector 22 Market", 4), ("Sector 17 Plaza", 5)],
+    "Garden of Silence": [("ISBT Sector 43", 8), ("Cricket Stadium", 3), ("Japanese Garden", 2)],
+    "Japanese Garden": [("Garden of Silence", 2), ("Sector 22 Market", 5), ("Chandigarh Airport", 10)],
+    "Sector 22 Market": [("Cricket Stadium", 4), ("Sector 17 Plaza", 3), ("Japanese Garden", 5), ("ISBT Sector 43", 4)],
+    "Mansa Devi Temple": [("Elante Mall", 12), ("Sukhna Lake", 12), ("Chandigarh Railway Station", 10)],
+}
+
+# Roads work both ways: add any missing reverse links (fixes unreachable places).
+for _a, _links in list(PLACES.items()):
+    for _b, _km in _links:
+        if not any(n == _a for n, _ in PLACES[_b]):
+            PLACES[_b].append((_a, _km))
+
+# Assumed average city speeds in km/h (rough estimates for the demo).
+SPEEDS = {"Walk": 5, "Bike": 25, "Auto": 22, "Car": 30}
+
+# Cost assumptions in rupees. These are EDITABLE ESTIMATES: replace with real local rates.
+PETROL = 95                      # rupees per litre
+MILEAGE = {"Bike": 40, "Car": 15}  # km per litre
+AUTO_BASE, AUTO_PER_KM, AUTO_WAIT_PER_MIN = 30, 14, 1.5  # fare, per km, per minute stuck in traffic
+
+# ---- City-wide traffic model (applies to EVERY road) ----
+# Busy hubs attract more traffic on all roads touching them. The time of day
+# shifts congestion up or down across the whole network. Simulated, not live.
+HUBS = {"ISBT Sector 17", "ISBT Sector 43", "Sector 17 Plaza", "Elante Mall",
+        "Chandigarh Railway Station", "Chandigarh Airport", "PGIMER", "Capitol Complex"}
+PERIOD_SHIFT = {"Morning peak (8-10)": 1, "Midday": 0, "Evening peak (5-8)": 2, "Night": -2}
+LEVELS = ["Clear", "Moderate", "Heavy"]
+LEVEL_COLORS = ["#2fb26b", "#f0b429", "#e5484d"]
+DELAY = [1.0, 1.6, 2.5]  # travel-time multiplier for each level
+
+KM = {(a, b): km for a, links in PLACES.items() for b, km in links}
+
+
+def build_traffic(period):
+    """Give every road a congestion level 0 (clear) to 2 (heavy)."""
+    traffic = {}
+    for (a, b) in KM:
+        key = frozenset((a, b))
+        if key not in traffic:
+            score = zlib.crc32("|".join(sorted(key)).encode()) % 3
+            score += (a in HUBS) + (b in HUBS) + PERIOD_SHIFT[period]
+            traffic[key] = 0 if score <= 1 else 1 if score <= 3 else 2
+    return traffic
+
+
+def make_cost(traffic, mode, fastest, closed=frozenset()):
+    """Edge cost: distance for 'shortest', minutes (with traffic) for 'fastest'.
+    Closed roads cost infinity, so they are never used."""
+    speed = SPEEDS[mode]
+    def cost(a, b, km):
+        key = frozenset((a, b))
+        if key in closed:
+            return float("inf")
+        if not fastest:
+            return km
+        delay = 1.0 if mode == "Walk" else DELAY[traffic[key]]
+        return km / speed * 60 * delay
+    return cost
+
+
+def route_between(start, finish, cost):
+    """Dijkstra: cheapest route under the given cost function (None if unreachable)."""
+    costs = {place: float("inf") for place in PLACES}
+    previous = {}
+    costs[start] = 0
+    queue = [(0, start)]
+    while queue:
+        spent, place = heapq.heappop(queue)
+        if spent > costs[place]:
+            continue
+        if place == finish:
+            break
+        for neighbor, kilometres in PLACES[place]:
+            new_cost = spent + cost(place, neighbor, kilometres)
+            if new_cost < costs[neighbor]:
+                costs[neighbor] = new_cost
+                previous[neighbor] = place
+                heapq.heappush(queue, (new_cost, neighbor))
+    if costs[finish] == float("inf"):
+        return None, float("inf")
+    path = [finish]
+    while path[-1] != start:
+        path.append(previous[path[-1]])
+    return list(reversed(path)), costs[finish]
+
+
+def trip_between(start, via, finish, cost):
+    """Cheapest route that passes through an optional via stop."""
+    if not via:
+        return route_between(start, finish, cost)
+    p1, c1 = route_between(start, via, cost)
+    p2, c2 = route_between(via, finish, cost)
+    if p1 is None or p2 is None:
+        return None, float("inf")
+    return p1 + p2[1:], c1 + c2
+
+
+def trip_stats(path, traffic, mode):
+    """Return (km, minutes with traffic, minutes with empty roads, heavy segments)."""
+    km = minutes = free = heavy = 0
+    for a, b in zip(path, path[1:]):
+        level = traffic[frozenset((a, b))]
+        base = KM[(a, b)] / SPEEDS[mode] * 60
+        km += KM[(a, b)]
+        free += base
+        minutes += base * (1.0 if mode == "Walk" else DELAY[level])
+        heavy += level == 2 and mode != "Walk"
+    return km, round(minutes), round(free), heavy
+
+
+def trip_cost(path, traffic, mode):
+    """Estimated rupees. Fuel use rises in traffic; auto fares add a waiting charge."""
+    if mode == "Walk":
+        return 0
+    fuel = km = wait = 0.0
+    for a, b in zip(path, path[1:]):
+        d, mult = KM[(a, b)], DELAY[traffic[frozenset((a, b))]]
+        km += d
+        wait += d / SPEEDS[mode] * 60 * (mult - 1)
+        if mode in MILEAGE:
+            fuel += d / MILEAGE[mode] * PETROL * (1 + 0.2 * (mult - 1))
+    return round(AUTO_BASE + AUTO_PER_KM * km + AUTO_WAIT_PER_MIN * wait) if mode == "Auto" else round(fuel)
+
+
+def plan_trip(start, via, finish, mode, traffic, closed=frozenset(), fastest=True):
+    """One call that returns everything about a trip, or None if no route exists."""
+    path, _ = trip_between(start, via, finish, make_cost(traffic, mode, fastest, closed))
+    if path is None:
+        return None
+    km, minutes, free, heavy = trip_stats(path, traffic, mode)
+    return {"path": path, "km": km, "minutes": minutes, "free": free, "heavy": heavy,
+            "fare": trip_cost(path, traffic, mode)}
+
+
+def road_points(a, b):
+    """The bent line used to draw the road between two places."""
+    (x1, y1), (x2, y2) = COORDS[a], COORDS[b]
+    bend = (x1 + x2) // 2
+    return [(x1, y1), (bend, y1), (bend, y2), (x2, y2)]
+
+
+def segment_distance(px, py, x1, y1, x2, y2):
+    length = (x2 - x1) ** 2 + (y2 - y1) ** 2
+    t = 0 if length == 0 else max(0, min(1, ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / length))
+    return ((px - (x1 + t * (x2 - x1))) ** 2 + (py - (y1 + t * (y2 - y1))) ** 2) ** 0.5
+
+
+def nearest_road(px, py, edges, limit=8):
+    """The road (frozenset of two places) closest to a map click, or None."""
+    best = None
+    for edge in edges:
+        pts = road_points(*sorted(edge))
+        d = min(segment_distance(px, py, *pts[i], *pts[i + 1]) for i in range(3))
+        if d < limit and (best is None or d < best[0]):
+            best = (d, edge)
+    return best[1] if best else None
+
+
+COORDS = {"Chandigarh Railway Station":(110,100),"Chandigarh Airport":(110,360),"ISBT Sector 17":(350,210),"ISBT Sector 43":(600,420),"Sector 17 Plaza":(390,260),"Capitol Complex":(570,150),"Rose Garden":(450,160),"Panjab University":(340,100),"PGIMER":(270,140),"Sukhna Lake":(680,100),"Rock Garden":(680,180),"Zakir Hussain Rose Garden":(490,90),"Tagore Theatre":(400,130),"Elante Mall":(250,350),"Industrial Area":(240,250),"Cricket Stadium":(590,320),"Garden of Silence":(740,400),"Japanese Garden":(780,300),"Sector 22 Market":(470,350),"Mansa Devi Temple":(800,180)}
+
+
+class ChandigarhApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("Chandigarh Compass | City Route Planner")
+        root.geometry("1280x840")
+        root.minsize(1180, 780)
+        root.configure(bg="#eef3f8")
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        style.configure("TCombobox", padding=8, fieldbackground="#f8fafc", background="white", foreground="#17324d", arrowcolor="#1769aa")
+        style.map("TCombobox", fieldbackground=[("readonly", "#f8fafc")])
+        tk.Label(root, text="Chandigarh Compass", font=("Segoe UI", 25, "bold"), bg="#eef3f8", fg="#17324d").pack(anchor="w", padx=24, pady=(18, 0))
+        tk.Label(root, text="Explore the City Beautiful · traffic-aware sample routes", font=("Segoe UI", 11), bg="#eef3f8", fg="#66798d").pack(anchor="w", padx=28, pady=(0, 14))
+        bar = tk.Frame(root, bg="white", padx=15, pady=12); bar.pack(fill="x", padx=22)
+        names = sorted(PLACES)
+        def label(text, row, col, padx=0):
+            tk.Label(bar, text=text, bg="white", fg="#66798d", font=("Segoe UI", 8, "bold")).grid(row=row, column=col, sticky="w", padx=padx)
+        label("FROM", 0, 0); label("TO", 0, 1, 12); label("VIA STOP (optional)", 0, 2)
+        label("TIME OF DAY", 2, 0); label("TRAVEL BY", 2, 1, 12); label("ROUTE TYPE", 2, 2)
+        self.start = ttk.Combobox(bar, values=names, state="readonly", width=28)
+        self.end = ttk.Combobox(bar, values=names, state="readonly", width=28)
+        self.via = ttk.Combobox(bar, values=[""] + names, state="readonly", width=24)
+        self.period = ttk.Combobox(bar, values=list(PERIOD_SHIFT), state="readonly", width=28)
+        self.mode = ttk.Combobox(bar, values=list(SPEEDS), state="readonly", width=28)
+        self.by = ttk.Combobox(bar, values=["Fastest (traffic-aware)", "Shortest distance"], state="readonly", width=24)
+        self.start.grid(row=1, column=0); self.end.grid(row=1, column=1, padx=12); self.via.grid(row=1, column=2)
+        self.period.grid(row=3, column=0, pady=(0, 2)); self.mode.grid(row=3, column=1, padx=12); self.by.grid(row=3, column=2)
+        self.start.set("ISBT Sector 17"); self.end.set("Sukhna Lake"); self.via.set("")
+        self.period.set("Morning peak (8-10)"); self.mode.set("Car"); self.by.set("Fastest (traffic-aware)")
+        self.show_traffic = tk.BooleanVar(value=True)
+        tk.Button(bar, text="Find my route", command=self.find, bg="#14806a", fg="white", relief="flat", padx=16, pady=7, font=("Segoe UI", 10, "bold")).grid(row=0, column=3, rowspan=3, padx=(14, 6), sticky="nsew")
+        tk.Button(bar, text="Compare & plan trip", command=self.insights, bg="#1769aa", fg="white", relief="flat", padx=16, pady=7, font=("Segoe UI", 10, "bold")).grid(row=0, column=4, rowspan=3, padx=6, sticky="nsew")
+        tk.Checkbutton(bar, text="Show traffic on map", variable=self.show_traffic, command=self.refresh, bg="white", fg="#40546a", activebackground="white").grid(row=3, column=3, columnspan=2)
+        self.period.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        self.route = None
+        self.closed = set()
+        self.traffic_all = {p: build_traffic(p) for p in PERIOD_SHIFT}
+        self.traffic = self.traffic_all[self.period.get()]
+        body = tk.Frame(root, bg="#eef3f8"); body.pack(fill="both", expand=True, padx=22, pady=16)
+        self.map = tk.Canvas(body, bg="white", highlightthickness=0); self.map.pack(side="left", fill="both", expand=True)
+        self.map.bind("<Button-1>", self.click_map)
+        panel = tk.Frame(body, bg="white", width=290, padx=15, pady=14); panel.pack(side="right", fill="y", padx=(14, 0)); panel.pack_propagate(False)
+        tk.Label(panel, text="YOUR ROUTE", bg="white", fg="#14806a", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.result = tk.Label(panel, text="Choose two landmarks, then find a route.", bg="white", fg="#17324d", justify="left", wraplength=255, font=("Segoe UI", 10))
+        self.result.pack(anchor="w", pady=8)
+        tk.Label(panel, text="CITY TRAFFIC NOW", bg="white", fg="#e5484d", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 2))
+        self.summary = tk.Label(panel, text="", bg="white", fg="#40546a", justify="left", wraplength=255, font=("Segoe UI", 9))
+        self.summary.pack(anchor="w")
+        tk.Label(panel, text=f"{len(names)} CITY PLACES", bg="white", fg="#14806a", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 5))
+        listing = tk.Text(panel, height=4, bg="white", fg="#40546a", relief="flat", wrap="word", font=("Segoe UI", 9))
+        listing.pack(fill="both", expand=True); listing.insert("end", "\n".join(names)); listing.configure(state="disabled")
+        tk.Label(root, text="Simulated traffic and estimated costs for a coding project; check a live map before travelling.", bg="#eef3f8", fg="#78899b", font=("Segoe UI", 9)).pack(anchor="w", padx=26, pady=(0, 8))
+        self.refresh()
+
+    def marker(self, place):
+        """Return a short, font-safe map badge and its color."""
+        name = place.lower()
+        if any(word in name for word in ("entrance", "parking", "station", "isbt", "airport")):
+            return "P", "#2878b5"
+        if any(word in name for word in ("food", "coffee", "cafe")):
+            return "F", "#e28a2b"
+        if any(word in name for word in ("cinema", "game", "kids", "play", "theatre", "garden", "lake", "rock")):
+            return "A", "#7a55b7"
+        if any(word in name for word in ("hospital", "pgimer", "temple", "capitol", "university", "plaza")):
+            return "L", "#16806a"
+        if any(word in name for word in ("mall", "shop", "street", "store", "book", "jewellery", "market", "supermarket", "area")):
+            return "S", "#d25d74"
+        return "M", "#62748a"
+
+    def road(self, a, b, color, width, dash=None):
+        flat = [c for point in road_points(a, b) for c in point]
+        self.map.create_line(*flat, fill=color, width=width, joinstyle="round", dash=dash)
+
+    def draw_map(self, route=None):
+        self.map.delete("all")
+        self.map.create_text(16, 12, text="CHANDIGARH · schematic sector grid · click any road to close or reopen it", anchor="nw", fill="#8292a5", font=("Segoe UI", 9, "bold"))
+        legend = [("#dce5ef", "Roads")] if not self.show_traffic.get() else list(zip(LEVEL_COLORS, LEVELS))
+        legend += [("#333333", "Closed"), ("#1d4ed8", "Your route")]
+        x = 20
+        for color, text in legend:
+            self.map.create_line(x, 42, x + 28, 42, fill=color, width=5)
+            self.map.create_text(x + 35, 42, text=text, anchor="w", fill="#60748a", font=("Segoe UI", 9))
+            x += 105
+        for edge, level in self.traffic.items():
+            a, b = sorted(edge)
+            if edge in self.closed:
+                self.road(a, b, "#333333", 4, dash=(5, 4))
+            else:
+                self.road(a, b, LEVEL_COLORS[level] if self.show_traffic.get() else "#dce5ef", 3)
+        if route:
+            for a, b in zip(route, route[1:]):
+                self.road(a, b, "#1d4ed8", 6)
+        for place, (x, y) in COORDS.items():
+            badge, badge_color = self.marker(place)
+            self.map.create_oval(x-12, y-12, x+12, y+12, fill="#1d4ed8" if route and place in route else badge_color, outline="white", width=2)
+            self.map.create_text(x, y, text=badge, fill="white", font=("Segoe UI", 8, "bold"))
+            self.map.create_text(x, y-11, text=place, anchor="s", fill="#263a50", font=("Segoe UI", 8, "bold"))
+
+    def click_map(self, event):
+        """Clicking a road closes it (an accident or roadwork); clicking again reopens it."""
+        if any((event.x - x) ** 2 + (event.y - y) ** 2 < 15 ** 2 for x, y in COORDS.values()):
+            return
+        edge = nearest_road(event.x, event.y, self.traffic)
+        if edge:
+            self.closed ^= {edge}
+            self.refresh()
+
+    def refresh(self):
+        """Time of day, traffic toggle or closures changed: update every road and any open route."""
+        self.traffic = self.traffic_all[self.period.get()]
+        counts = [sum(1 for e, v in self.traffic.items() if v == i and e not in self.closed) for i in range(3)]
+        worst = sorted((e for e, v in self.traffic.items() if v == 2 and e not in self.closed), key=lambda e: -KM.get(tuple(e), 0))[:3]
+        worst_text = "\n".join("• " + " – ".join(sorted(e)) for e in worst) or "No heavy roads right now"
+        self.summary.config(text=f"{counts[2]} heavy · {counts[1]} moderate · {counts[0]} clear · {len(self.closed)} closed\n\nMost congested:\n{worst_text}")
+        if self.route:
+            self.find()
+        else:
+            self.draw_map()
+
+    def read_trip(self):
+        start, finish, via = self.start.get(), self.end.get(), self.via.get()
+        if start == finish or via in (start, finish):
+            self.result.config(text="Choose different places for From, To and Via.")
+            return None
+        return start, via, finish
+
+    def find(self):
+        trip = self.read_trip()
+        if not trip:
+            return
+        start, via, finish = trip
+        mode, fastest = self.mode.get(), self.by.get().startswith("Fastest")
+        r = plan_trip(start, via, finish, mode, self.traffic, self.closed, fastest)
+        if r is None:
+            self.route = None
+            self.result.config(text="No route available: too many roads are closed. Click a dashed road on the map to reopen it.")
+            self.draw_map()
+            return
+        cost_text = "free" if mode == "Walk" else f"about ₹{r['fare']}"
+        lines = [f"{r['minutes']} min · {r['km']} km · {cost_text}", f"by {mode.lower()}, {self.period.get().lower()}"]
+        if via:
+            lines.append(f"via {via}")
+        if r["minutes"] - r["free"] >= 1:
+            lines.append(f"Traffic adds about {r['minutes'] - r['free']} min")
+        if r["heavy"]:
+            lines.append(f"{r['heavy']} heavy-traffic segment(s) on this route")
+        if fastest:
+            short = plan_trip(start, via, finish, mode, self.traffic, self.closed, False)
+            saved = short["minutes"] - r["minutes"]
+            if saved >= 1:
+                lines.append(f"Saves {saved} min vs the shortest-distance route")
+        if mode != "Walk":
+            options = {p: plan_trip(start, via, finish, mode, t, self.closed) for p, t in self.traffic_all.items()}
+            best = min(options, key=lambda p: options[p]["minutes"])
+            gain = r["minutes"] - options[best]["minutes"]
+            if gain >= 3:
+                lines.append(f"Tip: leaving at '{best}' would save {gain} min")
+        self.result.config(text="\n".join(lines) + "\n\n" + " → ".join(path_names(r["path"])))
+        self.route = r["path"]
+        self.draw_map(r["path"])
+
+    def insights(self):
+        """Window with two tabs: compare travel modes, and pick the best time to leave."""
+        trip = self.read_trip()
+        if not trip:
+            return
+        start, via, finish = trip
+        win = tk.Toplevel(self.root)
+        win.title("Compare & plan trip")
+        win.geometry("780x560")
+        win.configure(bg="#eef3f8")
+        heading = f"{start} → {via + ' → ' if via else ''}{finish}"
+        tk.Label(win, text=heading, bg="#eef3f8", fg="#17324d", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=16, pady=(14, 6))
+        notebook = ttk.Notebook(win); notebook.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        # --- Tab 1: compare modes (current time of day and closures) ---
+        tab1 = tk.Frame(notebook, bg="white", padx=12, pady=12); notebook.add(tab1, text="Compare travel modes")
+        tk.Label(tab1, text=f"Conditions: {self.period.get()}, {len(self.closed)} closed road(s)", bg="white", fg="#66798d").pack(anchor="w", pady=(0, 8))
+        table = ttk.Treeview(tab1, columns=("mode", "time", "km", "delay", "cost", "note"), show="headings", height=5)
+        for col, text, width in (("mode", "Mode", 90), ("time", "Time", 80), ("km", "Distance", 80), ("delay", "Traffic delay", 100), ("cost", "Est. cost", 90), ("note", "", 190)):
+            table.heading(col, text=text); table.column(col, width=width, anchor="w")
+        table.pack(fill="x")
+        results = {m: plan_trip(start, via, finish, m, self.traffic, self.closed) for m in SPEEDS}
+        reachable = {m: r for m, r in results.items() if r}
+        fastest = min(reachable, key=lambda m: reachable[m]["minutes"]) if reachable else None
+        rides = [m for m in reachable if m != "Walk"]
+        cheapest = min(rides, key=lambda m: reachable[m]["fare"]) if rides else None
+        for m, r in results.items():
+            if not r:
+                table.insert("", "end", values=(m, "no route", "", "", "", "")); continue
+            notes = [n for n, flag in (("Fastest", m == fastest), ("Cheapest ride", m == cheapest), ("Free", m == "Walk")) if flag]
+            table.insert("", "end", values=(m, f"{r['minutes']} min", f"{r['km']} km", f"+{r['minutes'] - r['free']} min", "₹0" if m == "Walk" else f"₹{r['fare']}", ", ".join(notes)))
+        tk.Label(tab1, text="Walking is not affected by traffic. Costs use editable estimates (petrol, mileage, auto fare) in the code.", bg="white", fg="#78899b", wraplength=700, justify="left").pack(anchor="w", pady=10)
+
+        # --- Tab 2: departure planner for the chosen travel mode ---
+        mode = self.mode.get()
+        tab2 = tk.Frame(notebook, bg="white", padx=12, pady=12); notebook.add(tab2, text="Best time to leave")
+        plans = {p: plan_trip(start, via, finish, mode, t, self.closed) for p, t in self.traffic_all.items()}
+        if not all(plans.values()):
+            tk.Label(tab2, text="No route available with the current closures.", bg="white", fg="#e5484d").pack(anchor="w")
+        else:
+            best = min(plans, key=lambda p: (plans[p]["minutes"], plans[p]["fare"]))
+            tk.Label(tab2, text=f"Travelling by {mode.lower()}. Best time to leave: {best}", bg="white", fg="#14806a", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+            chart = tk.Canvas(tab2, width=720, height=190, bg="white", highlightthickness=0); chart.pack(anchor="w")
+            longest = max(r["minutes"] for r in plans.values())
+            for i, (p, r) in enumerate(plans.items()):
+                y = 12 + i * 44
+                ratio = r["minutes"] / max(r["free"], 1)
+                color = LEVEL_COLORS[0 if ratio < 1.15 else 1 if ratio < 1.5 else 2]
+                chart.create_text(0, y + 12, text=p, anchor="w", fill="#263a50", font=("Segoe UI", 9, "bold"))
+                chart.create_rectangle(170, y, 170 + 400 * r["minutes"] / longest, y + 26, fill=color, outline="")
+                chart.create_text(178 + 400 * r["minutes"] / longest, y + 13, text=f"{r['minutes']} min · ₹{r['fare']}", anchor="w", fill="#263a50", font=("Segoe UI", 9))
+            for p, r in plans.items():
+                extra = r["minutes"] - plans[best]["minutes"]
+                tk.Label(tab2, text=f"{p}: {'best choice' if p == best else f'+{extra} min vs best'}", bg="white", fg="#40546a").pack(anchor="w")
+            if mode == "Walk":
+                tk.Label(tab2, text="Walking time does not change with traffic.", bg="white", fg="#78899b").pack(anchor="w", pady=6)
+
+
+def path_names(path):
+    return path
+
+
+if __name__ == "__main__":
+    window = tk.Tk()
+    ChandigarhApp(window)
+    window.mainloop()
